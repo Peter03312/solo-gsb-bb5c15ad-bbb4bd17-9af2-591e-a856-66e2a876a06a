@@ -400,3 +400,82 @@ class RoleAssignResponse(BaseModel):
     assignments: list[ManuscriptRolesOut] | None
     # 不可行时给出各角色缺口诊断；可行时为 null
     unsatisfied: list[RoleUnsatisfiedOut] | None
+
+
+# ---------- POST /conflict-audit：资格审计（含合作链利益冲突） ----------
+
+_PersonId = Annotated[str, Field(min_length=1, max_length=128)]
+
+
+class ConflictAuditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    manuscripts: list[ManuscriptIn] = Field(max_length=10000)
+    # capacity / track_capacities 等分配字段可照常携带，审计只读取资格相关字段
+    reviewers: list[ReviewerIn] = Field(max_length=10000)
+    collaboration_edges: list[tuple[_PersonId, _PersonId]] = Field(
+        default_factory=list,
+        max_length=100000,
+        description=(
+            "人员 ID 组成的无向合作关系边 [人员A, 人员B]；边无方向、重复边自动去重，"
+            "边中人员不必是稿件作者或评审人（可仅作为合作链中间节点）"
+        ),
+    )
+    max_hops: int = Field(
+        ge=1, le=6,
+        description="合作链利益冲突的最大跳数（1～6）：评审人到稿件任一作者的"
+                    "最短合作链不超过该跳数即判利益冲突",
+    )
+
+    @model_validator(mode="after")
+    def _check_unique_ids(self) -> "ConflictAuditRequest":
+        m_ids = [m.id for m in self.manuscripts]
+        if len(m_ids) != len(set(m_ids)):
+            raise ValueError("manuscripts 中存在重复的 id")
+        r_ids = [r.id for r in self.reviewers]
+        if len(r_ids) != len(set(r_ids)):
+            raise ValueError("reviewers 中存在重复的 id")
+        return self
+
+
+# 利益冲突原因（主题不匹配不是利益冲突，单独以 topic_mismatch 标记）：
+#   self_conflict                —— 评审人是稿件作者（自稿冲突）
+#   author_conflict              —— 评审人显式声明与稿件作者冲突
+#   manuscript_conflict          —— 评审人显式声明回避该稿件
+#   collaboration_chain_conflict —— 评审人经不超过 max_hops 跳的合作链关联到稿件作者
+ConflictReason = Literal[
+    "self_conflict",
+    "author_conflict",
+    "manuscript_conflict",
+    "collaboration_chain_conflict",
+]
+
+
+class IneligiblePairOut(BaseModel):
+    """一个不合格（稿件, 评审人）配对的全部原因。"""
+
+    reviewer_id: str
+    # 利益冲突原因（可多个并存，固定顺序）；仅主题不匹配时为空列表
+    reasons: list[ConflictReason]
+    # 主题不匹配单独标记（可与任一利益冲突原因并存）
+    topic_mismatch: bool
+    # 仅 collaboration_chain_conflict 时给出最短人员路径 [评审人, ..., 作者]
+    collaboration_path: list[str] | None = None
+    # 最短合作链跳数（= len(collaboration_path) - 1）；无合作链冲突时为 null
+    hops: int | None = None
+
+
+class ManuscriptAuditOut(BaseModel):
+    """某稿件对全部评审人的资格审计结果。"""
+
+    manuscript_id: str
+    # 合格评审人 ID（无任何利益冲突原因且主题匹配），按 ID 排序
+    eligible_reviewer_ids: list[str]
+    # 不合格配对，按评审人 ID 排序
+    ineligible_pairs: list[IneligiblePairOut]
+
+
+class ConflictAuditResponse(BaseModel):
+    max_hops: int
+    # 按稿件 ID 排序
+    audits: list[ManuscriptAuditOut]

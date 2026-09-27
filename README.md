@@ -47,6 +47,14 @@
 可行时返回按稿件、角色分组且顺序确定的完整名单；不可行时按角色返回缺口，
 不输出任何部分分配。
 
+`POST /conflict-audit` 提供**资格审计**（只读，不改动任何分配结果）：逐稿件、逐评审人
+判定是否具备评审资格。沿用自稿冲突、显式回避（`conflicted_authors` /
+`conflicted_manuscripts`）与主题匹配规则；另接受人员 ID 组成的**无向合作关系边**
+`collaboration_edges` 与最大链长 `max_hops`（1～6），评审人到稿件**任一作者**存在
+不超过 `max_hops` 跳的合作链时判为合作链利益冲突，并返回**最短人员路径**；等长路径
+按完整 ID 序列字典序选取。响应按 ID 排序，分别列出每个稿件的合格评审人与不合格配对
+的全部原因；主题不匹配不属于利益冲突，以 `topic_mismatch` 单独标记。
+
 ## 快速启动（单条命令）
 
 ```bash
@@ -63,6 +71,7 @@ docker compose up --build
 | http://localhost:8000/assign | 分配接口（POST） |
 | http://localhost:8000/assign-coverage | 评审人下限覆盖分配接口（POST） |
 | http://localhost:8000/assign-roles | 分角色分配接口（POST） |
+| http://localhost:8000/conflict-audit | 资格审计接口（POST，只读） |
 | http://localhost:8000/docs | Swagger 交互式文档 |
 | http://localhost:8000/redoc | ReDoc 文档 |
 
@@ -705,6 +714,124 @@ docker run -p 8000:8000 review-assign
 - `eligible_remaining_capacity`：最大流结束后这些候选对该稿赛道的剩余可接量之和
   （候选受赛道限额约束时，取总剩余容量与赛道剩余限额的较小者）。
 
+### `POST /conflict-audit`（资格审计，只读）
+
+逐稿件、逐评审人审计评审资格，**只审计资格，不输出也不改动任何分配结果**。
+
+资格规则与 `POST /assign` 完全一致：
+
+- 自稿冲突（`self_conflict`）：评审人 `id` 出现在稿件 `authors` 中；
+- 显式作者回避（`author_conflict`）：稿件作者与评审人 `conflicted_authors` 有交集；
+- 显式稿件回避（`manuscript_conflict`）：稿件 `id` 出现在评审人
+  `conflicted_manuscripts` 中；
+- 主题匹配：稿件 `topics` 非空时，评审人 `topics` 须与其有交集。主题不匹配
+  **不是利益冲突**，在响应中以 `topic_mismatch: true` 单独标记（可与任一利益
+  冲突原因并存）。
+
+**合作链利益冲突**（`collaboration_chain_conflict`）：在由人员 ID 组成的无向
+合作图 `collaboration_edges`（`[人员A, 人员B]` 边列表）上，评审人到稿件**任一
+作者**存在长度不超过 `max_hops` 跳（1～6）的路径时判为利益冲突；边无方向，
+边中人员不必是稿件作者或评审人（可仅作为合作链中间节点）。命中时返回：
+
+- `collaboration_path`：最短人员路径 `[评审人, 中间人员..., 作者]`；
+- `hops`：最短路径跳数，即 `len(collaboration_path) - 1`。
+
+等长最短路径按**完整 ID 序列字典序**取最小（先逐跳取字典序最小的可完成路径，
+而非仅比较作者 ID）。评审人本人是作者时按 `self_conflict` 处理（0 跳不计入合作
+链）；到**其他**合著者仍存在 1～`max_hops` 跳路径时，两个原因同时列出。
+
+请求体：
+
+```json
+{
+  "max_hops": 2,
+  "manuscripts": [
+    {"id": "m1", "authors": ["alice"], "topics": ["ml"]},
+    {"id": "m2", "authors": ["bob"], "topics": ["db"]}
+  ],
+  "reviewers": [
+    {"id": "r1", "topics": ["ml"], "capacity": 2},
+    {"id": "r2", "topics": ["nlp"], "capacity": 1,
+     "conflicted_manuscripts": ["m1"]},
+    {"id": "r3", "topics": ["ml"], "capacity": 1}
+  ],
+  "collaboration_edges": [
+    ["r3", "x"],
+    ["x", "alice"]
+  ]
+}
+```
+
+字段规则：
+
+- `max_hops`（必填，1～6）：合作链利益冲突的最大跳数，超出范围返回 `422`。
+- `manuscripts` / `reviewers`：与 `POST /assign` 相同的稿件 / 评审人对象；
+  审计只读取资格相关字段（`authors` / `topics` / `conflicted_authors` /
+  `conflicted_manuscripts`），`capacity`、`track_capacities`、
+  `required_reviewers` 等分配字段**不影响**审计结果（仍按原规则校验取值范围）。
+- `collaboration_edges`（可选，缺省为空）：人员 ID 二元组数组。边为无向边，
+  **重复边、反向边（`[a,b]` 与 `[b,a]`）与自环（`[a,a]`）自动忽略**，
+  端点 ID 不能为空；边及各列表的输入顺序不影响结果。
+- 稿件 / 评审人 `id` 必须各自唯一，否则返回 `422`。
+
+响应（`200`）：`audits` 按稿件 ID 排序；每个稿件的 `eligible_reviewer_ids`
+（无任何利益冲突原因且主题匹配的评审人）与 `ineligible_pairs`（其余全部评审人）
+均按评审人 ID 排序，每个不合格配对列出其**全部**原因。相同输入（含重复边与列表
+乱序）必然产生逐字节相同的输出：
+
+```json
+{
+  "max_hops": 2,
+  "audits": [
+    {
+      "manuscript_id": "m1",
+      "eligible_reviewer_ids": ["r1"],
+      "ineligible_pairs": [
+        {
+          "reviewer_id": "r2",
+          "reasons": ["manuscript_conflict"],
+          "topic_mismatch": true,
+          "collaboration_path": null,
+          "hops": null
+        },
+        {
+          "reviewer_id": "r3",
+          "reasons": ["collaboration_chain_conflict"],
+          "topic_mismatch": false,
+          "collaboration_path": ["r3", "x", "alice"],
+          "hops": 2
+        }
+      ]
+    },
+    {
+      "manuscript_id": "m2",
+      "eligible_reviewer_ids": [],
+      "ineligible_pairs": [
+        {"reviewer_id": "r1", "reasons": [], "topic_mismatch": true,
+         "collaboration_path": null, "hops": null},
+        {"reviewer_id": "r2", "reasons": [], "topic_mismatch": true,
+         "collaboration_path": null, "hops": null},
+        {"reviewer_id": "r3", "reasons": [], "topic_mismatch": true,
+         "collaboration_path": null, "hops": null}
+      ]
+    }
+  ]
+}
+```
+
+返回字段含义：
+
+| 字段 | 含义 |
+| --- | --- |
+| `max_hops` | 本次审计使用的最大合作链跳数（与请求一致） |
+| `audits[].manuscript_id` | 稿件 ID（按 ID 排序） |
+| `audits[].eligible_reviewer_ids` | 合格评审人 ID：无任何利益冲突原因且主题匹配（按 ID 排序） |
+| `ineligible_pairs[].reviewer_id` | 不合格配对的评审人 ID（按 ID 排序） |
+| `ineligible_pairs[].reasons` | 利益冲突原因列表，可多个并存，固定顺序为 `self_conflict` → `author_conflict` → `manuscript_conflict` → `collaboration_chain_conflict`；仅主题不匹配时为空列表 |
+| `ineligible_pairs[].topic_mismatch` | 主题不匹配单独标记（`true` 时不影响 `reasons`） |
+| `ineligible_pairs[].collaboration_path` | 合作链冲突时的最短人员路径 `[评审人, ..., 作者]`；无合作链冲突时为 `null` |
+| `ineligible_pairs[].hops` | 最短合作链跳数（`len(collaboration_path) - 1`）；无合作链冲突时为 `null` |
+
 ### 示例调用
 
 ```bash
@@ -823,6 +950,29 @@ curl -s -X POST http://localhost:8000/assign-roles \
       }'
 # -> assignments 按稿件、角色分组：m1 的 chair->r1、reviewer->r2（r1 不能身兼两角），
 #    m2 的 reviewer->r2、r3（r3 的 poster 赛道限额 1 与总容量同时生效）
+
+# 资格审计：自稿 / 显式回避 / 主题规则之外，合作链不超过 max_hops 跳也算利益冲突
+curl -s -X POST http://localhost:8000/conflict-audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "max_hops": 2,
+        "manuscripts": [
+          {"id": "m1", "authors": ["alice"], "topics": ["ml"]},
+          {"id": "m2", "authors": ["bob"], "topics": ["db"]}
+        ],
+        "reviewers": [
+          {"id": "r1", "topics": ["ml"], "capacity": 2},
+          {"id": "r2", "topics": ["nlp"], "capacity": 1,
+           "conflicted_manuscripts": ["m1"]},
+          {"id": "r3", "topics": ["ml"], "capacity": 1}
+        ],
+        "collaboration_edges": [
+          ["r3", "x"], ["x", "alice"]
+        ]
+      }'
+# -> m1 的合格评审人为 r1；r2 显式回避 m1 且主题不匹配；
+#    r3 经 2 跳合作链 r3 -> x -> alice 关联作者，collaboration_path 给出最短路径；
+#    m2 无任何评审人主题匹配（r1/r2/r3 均仅 topic_mismatch=true，reasons 为空）
 ```
 
 ## 算法与确定性
@@ -869,6 +1019,14 @@ curl -s -X POST http://localhost:8000/assign-roles \
   （割边只能落在稿件需求侧或评审人下限侧）可知全局不可行时两侧诊断至少其一非空；
   下限 > 容量、下限 > 个人可接上限（合格稿件数经赛道限额与容量折算）属结构性冲突，
   在求解前直接判定。
+- 资格审计（`/conflict-audit`）：在去重后的无向合作图上，对每个评审人做一次
+  至多 `max_hops` 跳的分层 BFS（`layers[d]` 为距评审人恰为 d 跳的人员集合），
+  与稿件作者集合相交的最小层即最短链跳数；等长路径按**完整 ID 序列字典序**
+  选取——自评审人起逐跳选取「仍能在剩余跳数内到达某个最短距离作者」的最小 ID
+  邻点（反向分层集合保证所选邻点确实可达目标层）。合作图只由边集合决定：
+  重复边、反向边与自环一律忽略，全部节点与列表均按 ID 排序处理，相同业务输入
+  （含不同列表顺序）产生逐字节相同的审计结果。审计接口无状态、不涉及任何流量
+  求解或分配结果，`capacity` 等容量字段不参与资格判定。
 - 所有节点按 ID 排序后建图，BFS / Dijkstra 均按固定邻接顺序与 (费用, 节点下标) 字典序
   执行，算法无随机性：相同输入（含不同的列表顺序）产生逐字节相同的输出，
   同成本解由 ID 顺序确定性地破除（瓶颈割的节点与边同样按业务 ID 确定排序）。
@@ -886,13 +1044,15 @@ uvicorn app.main:app --reload --port 8000   # 本地起服务
 
 ```
 app/
-  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles
+  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit
   models.py    # 请求/响应模型与校验
   solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化 + 下限覆盖带下界流 + 分角色全局分配
+  audit.py     # 资格审计：自稿/显式回避/主题匹配 + 无向合作图最短链（BFS 分层 + 完整 ID 序列字典序破同）
 tests/
   test_assign.py          # /assign 端到端测试
   test_assign_coverage.py # /assign-coverage 端到端测试
   test_assign_roles.py    # /assign-roles 端到端测试
+  test_conflict_audit.py  # /conflict-audit 端到端测试
 Dockerfile
 docker-compose.yml
 requirements.txt

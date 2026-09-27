@@ -11,11 +11,15 @@ from .models import (
     AssignResponse,
     BottleneckCutEdgeOut,
     BottleneckCutOut,
+    ConflictAuditRequest,
+    ConflictAuditResponse,
     CoverageAssignRequest,
     CoverageAssignResponse,
     CoverageConflictOut,
+    IneligiblePairOut,
     LoadRatioOut,
     LockedConflictOut,
+    ManuscriptAuditOut,
     ManuscriptRolesOut,
     ReviewerShortfallOut,
     RoleAssignRequest,
@@ -26,6 +30,7 @@ from .models import (
     UnsatisfiedOut,
     WorkloadBalanceOut,
 )
+from .audit import audit_conflicts
 from .solver import (
     BottleneckCut,
     ManuscriptSpec,
@@ -37,7 +42,7 @@ from .solver import (
 
 app = FastAPI(
     title="Anonymous Review Assignment API",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "匿名评审分配服务：基于全局最大流（非逐稿贪心）求满足主题能力、"
         "利益冲突与容量约束的完整分配；不可行时返回缺口诊断与全局最小割证明"
@@ -59,6 +64,11 @@ app = FastAPI(
         "评审人声明可担任角色，全部稿件的全部角色在同一流网络中一次全局求解，"
         "同一评审人对同一稿件最多承担一个角色，所有角色共享总容量与赛道限额；"
         "可行时返回按稿件、角色分组的完整名单，不可行时返回各角色缺口。"
+        "支持资格审计（POST /conflict-audit）：逐稿件、逐评审人判定资格，"
+        "沿用自稿、显式回避与主题匹配规则；另接受人员 ID 组成的无向合作关系边"
+        "与最大链长 max_hops（1～6），评审人到稿件任一作者存在不超过 max_hops "
+        "跳的合作链时判为合作链利益冲突，返回按完整 ID 序列字典序选取的最短"
+        "人员路径；审计只判定资格，不改动任何现有分配结果。"
         "服务无状态，不持久化任何稿件/评审信息。"
     ),
 )
@@ -348,4 +358,63 @@ def assign_roles(req: RoleAssignRequest) -> RoleAssignResponse:
         total_assigned=result.total_assigned,
         assignments=None,
         unsatisfied=[RoleUnsatisfiedOut(**vars(u)) for u in result.unsatisfied],
+    )
+
+
+@app.post("/conflict-audit", response_model=ConflictAuditResponse, tags=["audit"])
+def conflict_audit(req: ConflictAuditRequest) -> ConflictAuditResponse:
+    # 审计只读取资格相关字段（topics / authors / conflicted_*）；capacity、
+    # track_capacities、required_reviewers 等分配字段不影响审计结果。
+    manuscripts = [
+        ManuscriptSpec(
+            id=m.id,
+            authors=tuple(m.authors),
+            topics=tuple(m.topics),
+            required_reviewers=(
+                m.required_reviewers if m.required_reviewers is not None else 0
+            ),
+            track=m.track,
+        )
+        for m in req.manuscripts
+    ]
+    reviewers = [
+        ReviewerSpec(
+            id=r.id,
+            topics=tuple(r.topics),
+            capacity=r.capacity,
+            conflicted_authors=tuple(r.conflicted_authors),
+            conflicted_manuscripts=tuple(r.conflicted_manuscripts),
+        )
+        for r in req.reviewers
+    ]
+    # 无向边按 {端点排序} 去重：重复边、反向边与输入重排均不影响图本身
+    edges = frozenset(
+        (a, b) if a <= b else (b, a) for a, b in req.collaboration_edges
+    )
+
+    result = audit_conflicts(manuscripts, reviewers, edges, req.max_hops)
+
+    return ConflictAuditResponse(
+        max_hops=result.max_hops,
+        audits=[
+            ManuscriptAuditOut(
+                manuscript_id=a.manuscript_id,
+                eligible_reviewer_ids=list(a.eligible_reviewers),
+                ineligible_pairs=[
+                    IneligiblePairOut(
+                        reviewer_id=p.reviewer_id,
+                        reasons=list(p.reasons),
+                        topic_mismatch=p.topic_mismatch,
+                        collaboration_path=(
+                            list(p.collaboration_path)
+                            if p.collaboration_path is not None
+                            else None
+                        ),
+                        hops=p.hops,
+                    )
+                    for p in a.ineligible_pairs
+                ],
+            )
+            for a in result.audits
+        ],
     )
