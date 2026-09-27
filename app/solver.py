@@ -1729,3 +1729,167 @@ def solve_coverage_assignment(
         shared_pool=normal.shared_pool,
         reviewer_shortfalls=tuple(shortfalls),
     )
+
+
+# ---------- POST /conflict-audit：合作关系链利益冲突审计 ----------
+
+# 审计的冲突类原因（输出按此固定顺序）；主题不匹配单独标记（topic_mismatch），不在其中：
+#   self_conflict / author_conflict / manuscript_conflict —— 与分配接口一致的基础规则
+#   collaboration_chain_conflict —— 评审人到稿件任一作者存在不超过 max_hops 跳的合作链
+@dataclass(frozen=True)
+class CollaborationPath:
+    """评审人到稿件作者的最短合作链。"""
+
+    # 人员 ID 序列（评审人 -> ... -> 稿件作者，含两端）
+    person_ids: tuple[str, ...]
+    # 链长（边数），1 <= hops <= max_hops
+    hops: int
+
+
+@dataclass(frozen=True)
+class AuditIneligiblePair:
+    """某稿件下一名不合格评审人及其全部原因。"""
+
+    reviewer_id: str
+    # 冲突类原因（固定顺序）；主题不匹配由 topic_mismatch 单独标记
+    reasons: tuple[str, ...]
+    topic_mismatch: bool
+    # 仅当 reasons 含 collaboration_chain_conflict 时非空
+    collaboration_path: CollaborationPath | None
+
+
+@dataclass(frozen=True)
+class ManuscriptAudit:
+    """某稿件的资格审计结果（评审人按 ID 排序）。"""
+
+    manuscript_id: str
+    eligible_reviewer_ids: tuple[str, ...]
+    ineligible: tuple[AuditIneligiblePair, ...]
+
+
+@dataclass(frozen=True)
+class AuditResult:
+    # 稿件按 ID 排序
+    manuscripts: tuple[ManuscriptAudit, ...]
+    total_pairs: int
+    eligible_pairs: int
+    ineligible_pairs: int
+
+
+def _lex_min_shortest_paths(
+    adj: dict[str, list[str]], source: str, max_hops: int
+) -> dict[str, tuple[str, ...]]:
+    """source 出发、深度不超过 max_hops 的字典序最小最短人员路径。
+
+    邻接表已按 ID 升序；BFS 按「逐层、同层按父路径字典序」的顺序首次访问每个
+    节点，记录的父链即字典序最小的最短路径（同层节点的已记录路径按字典序排列，
+    归纳可得）。返回 {人员 ID: 从 source 到该人员的 ID 序列（含两端）}，
+    不含 source 自身（0 跳不算合作链）。
+    """
+    parent: dict[str, str] = {}
+    if source not in adj:
+        return parent
+    frontier = [source]
+    for _ in range(max_hops):
+        nxt: list[str] = []
+        for u in frontier:
+            for v in adj[u]:
+                if v != source and v not in parent:
+                    parent[v] = u
+                    nxt.append(v)
+        if not nxt:
+            break
+        frontier = nxt
+    paths: dict[str, tuple[str, ...]] = {}
+    for node in parent:
+        seq = [node]
+        while seq[-1] != source:
+            seq.append(parent[seq[-1]])
+        seq.reverse()
+        paths[node] = tuple(seq)
+    return paths
+
+
+def audit_conflicts(
+    manuscripts: list[ManuscriptSpec],
+    reviewers: list[ReviewerSpec],
+    collaboration_edges: list[tuple[str, str]],
+    max_hops: int,
+) -> AuditResult:
+    """逐对审计「稿件 x 评审人」的评审资格（只读，不做任何分配）。
+
+    自稿、显式回避（conflicted_authors / conflicted_manuscripts）与主题匹配规则
+    与 _pair_ineligibility_reasons 完全一致；在此基础上追加合作关系链冲突：
+    评审人到稿件任一作者在合作关系无向图中存在不超过 max_hops 跳的链时判为
+    利益冲突，并给出最短人员路径（等长时按完整 ID 序列字典序取最小；
+    自稿冲突即 0 跳，不属于合作链，仍由 self_conflict 标记）。
+
+    重复边（含方向互换）、自环边与输入列表顺序均不影响结果：边集去重后邻接表
+    按 ID 升序，稿件、评审人与输出原因均按 ID / 固定顺序排列。
+    """
+    # 无向合作关系图：去重、去自环，邻接表按 ID 升序
+    neighbors: dict[str, set[str]] = {}
+    for a, b in collaboration_edges:
+        if a == b:
+            continue
+        neighbors.setdefault(a, set()).add(b)
+        neighbors.setdefault(b, set()).add(a)
+    adj = {node: sorted(ns) for node, ns in neighbors.items()}
+
+    # 每个评审人至多一次限深 BFS（懒加载缓存，与稿件数量解耦）
+    path_cache: dict[str, dict[str, tuple[str, ...]]] = {}
+
+    def paths_from(reviewer_id: str) -> dict[str, tuple[str, ...]]:
+        cached = path_cache.get(reviewer_id)
+        if cached is None:
+            cached = _lex_min_shortest_paths(adj, reviewer_id, max_hops)
+            path_cache[reviewer_id] = cached
+        return cached
+
+    audits: list[ManuscriptAudit] = []
+    eligible_pairs = 0
+    ineligible_pairs = 0
+    for m in sorted(manuscripts, key=lambda x: x.id):
+        authors = set(m.authors)
+        eligible_ids: list[str] = []
+        ineligible: list[AuditIneligiblePair] = []
+        for r in sorted(reviewers, key=lambda x: x.id):
+            all_reasons = _pair_ineligibility_reasons(m, r)
+            topic_mismatch = "topic_mismatch" in all_reasons
+            reasons = [x for x in all_reasons if x != "topic_mismatch"]
+            path: CollaborationPath | None = None
+            if r.id not in authors:
+                # 到任一作者的最短链：按 (链长, 完整 ID 序列) 取最小
+                reach = paths_from(r.id)
+                best: tuple[str, ...] | None = None
+                for author in authors:
+                    p = reach.get(author)
+                    if p is not None and (
+                        best is None or (len(p), p) < (len(best), best)
+                    ):
+                        best = p
+                if best is not None:
+                    reasons.append("collaboration_chain_conflict")
+                    path = CollaborationPath(person_ids=best, hops=len(best) - 1)
+            if not reasons and not topic_mismatch:
+                eligible_ids.append(r.id)
+                eligible_pairs += 1
+            else:
+                ineligible.append(AuditIneligiblePair(
+                    reviewer_id=r.id,
+                    reasons=tuple(reasons),
+                    topic_mismatch=topic_mismatch,
+                    collaboration_path=path,
+                ))
+                ineligible_pairs += 1
+        audits.append(ManuscriptAudit(
+            manuscript_id=m.id,
+            eligible_reviewer_ids=tuple(eligible_ids),
+            ineligible=tuple(ineligible),
+        ))
+    return AuditResult(
+        manuscripts=tuple(audits),
+        total_pairs=eligible_pairs + ineligible_pairs,
+        eligible_pairs=eligible_pairs,
+        ineligible_pairs=ineligible_pairs,
+    )

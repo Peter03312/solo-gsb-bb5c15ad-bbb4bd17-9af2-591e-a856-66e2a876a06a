@@ -47,6 +47,13 @@
 可行时返回按稿件、角色分组且顺序确定的完整名单；不可行时按角色返回缺口，
 不输出任何部分分配。
 
+`POST /conflict-audit` 提供**合作链利益冲突审计**：输入稿件、评审人、人员 ID 组成的
+无向合作关系边与最大链长 `max_hops`（1～6），逐对审计每个稿件与评审人的评审资格——
+在自稿、显式回避与主题匹配规则（与 `/assign` 完全一致）之外，评审人到稿件任一作者
+存在不超过 `max_hops` 跳的合作链时也判为利益冲突，并返回最短人员路径（等长路径按
+完整 ID 序列字典序选取）。该接口**只审计资格，不改动现有分配结果**；重复边与输入
+重排不改变结果，响应按 ID 排序，主题不匹配单独标记。
+
 ## 快速启动（单条命令）
 
 ```bash
@@ -63,6 +70,7 @@ docker compose up --build
 | http://localhost:8000/assign | 分配接口（POST） |
 | http://localhost:8000/assign-coverage | 评审人下限覆盖分配接口（POST） |
 | http://localhost:8000/assign-roles | 分角色分配接口（POST） |
+| http://localhost:8000/conflict-audit | 合作链利益冲突审计接口（POST，只读） |
 | http://localhost:8000/docs | Swagger 交互式文档 |
 | http://localhost:8000/redoc | ReDoc 文档 |
 
@@ -705,6 +713,111 @@ docker run -p 8000:8000 review-assign
 - `eligible_remaining_capacity`：最大流结束后这些候选对该稿赛道的剩余可接量之和
   （候选受赛道限额约束时，取总剩余容量与赛道剩余限额的较小者）。
 
+### `POST /conflict-audit`（合作链利益冲突审计）
+
+只读审计接口：逐对判定「稿件 × 评审人」是否具备评审资格，**不做任何分配、不改动
+现有分配结果**。资格规则与 `/assign` 完全一致（自稿冲突、`conflicted_authors` /
+`conflicted_manuscripts` 显式回避、主题匹配），并追加**合作关系链冲突**：在人员
+合作关系无向图中，评审人到稿件任一作者存在不超过 `max_hops` 跳的链时判为利益冲突。
+
+请求体：
+
+```json
+{
+  "max_hops": 2,
+  "manuscripts": [
+    {"id": "m1", "authors": ["alice", "bob"], "topics": ["ml"]},
+    {"id": "m2", "authors": ["carol"], "topics": ["db"]}
+  ],
+  "reviewers": [
+    {"id": "r1", "topics": ["ml"], "capacity": 2},
+    {"id": "r2", "topics": ["ml", "db"], "capacity": 1, "conflicted_authors": ["carol"]},
+    {"id": "r3", "topics": ["db"], "capacity": 1}
+  ],
+  "collaboration_edges": [
+    {"person_ids": ["r1", "dave"]},
+    {"person_ids": ["dave", "alice"]},
+    {"person_ids": ["r3", "r3"]}
+  ]
+}
+```
+
+字段规则：
+
+- `max_hops`（必填）：合作链审计的最大跳数，整数 **1～6**。链长恰好等于 `max_hops`
+  也算冲突；需超过 `max_hops` 跳才连通的不算。
+- `collaboration_edges`（缺省为空列表）：人员 ID 组成的无向合作关系边，每条边为
+  恰好两个 ID 的 `person_ids` 数组。边内两个 ID 顺序无关；重复边（含方向互换）自动
+  去重；两端相同的自环边不产生任何合作链。边可以引用任意人员 ID（不限于稿件作者
+  或评审人）。
+- 稿件 / 评审人字段语义与 `POST /assign` 完全相同（`capacity` 等字段照常校验，但
+  容量与赛道限额不影响审计结论）；稿件 / 评审人 `id` 必须各自唯一，否则返回 `422`。
+- 自稿冲突（评审人即作者，0 跳）不属于合作链，仍由 `self_conflict` 标记。
+
+响应（`200`）：稿件按 ID 排序；每稿的合格名单与不合格配对均按评审人 ID 排序，
+重复边与输入重排不改变结果：
+
+```json
+{
+  "manuscripts": [
+    {
+      "manuscript_id": "m1",
+      "eligible_reviewer_ids": ["r2"],
+      "ineligible": [
+        {
+          "reviewer_id": "r1",
+          "reasons": ["collaboration_chain_conflict"],
+          "topic_mismatch": false,
+          "collaboration_path": {"person_ids": ["r1", "dave", "alice"], "hops": 2}
+        },
+        {
+          "reviewer_id": "r3",
+          "reasons": [],
+          "topic_mismatch": true,
+          "collaboration_path": null
+        }
+      ]
+    },
+    {
+      "manuscript_id": "m2",
+      "eligible_reviewer_ids": ["r3"],
+      "ineligible": [
+        {
+          "reviewer_id": "r1",
+          "reasons": [],
+          "topic_mismatch": true,
+          "collaboration_path": null
+        },
+        {
+          "reviewer_id": "r2",
+          "reasons": ["author_conflict"],
+          "topic_mismatch": false,
+          "collaboration_path": null
+        }
+      ]
+    }
+  ],
+  "total_pairs": 6,
+  "eligible_pairs": 2,
+  "ineligible_pairs": 4
+}
+```
+
+返回字段含义：
+
+- `manuscripts[].eligible_reviewer_ids`：具备评审资格的评审人 ID（按 ID 排序）；
+- `manuscripts[].ineligible[]`：不合格配对及其全部原因（按评审人 ID 排序）：
+  - `reasons`：冲突类原因列表，固定顺序为 `self_conflict` → `author_conflict` →
+    `manuscript_conflict` → `collaboration_chain_conflict`（可多项并存）；
+  - `topic_mismatch`：主题能力不匹配**单独标记**（布尔，与 `reasons` 并列，可与
+    冲突原因同时为真；稿件 `topics` 为空时恒为 `false`）；
+  - `collaboration_path`：仅合作链冲突时给出最短人员路径——`person_ids` 为评审人到
+    稿件作者的完整 ID 序列（含两端），`hops` 为链长（边数）；评审人到同一稿件多个
+    作者均可达时取（链长, 完整 ID 序列）最小者，等长路径按完整 ID 序列字典序选取；
+    无合作链冲突时为 `null`；
+- `total_pairs` / `eligible_pairs` / `ineligible_pairs`：审计配对总数与合格 /
+  不合格配对数（`total_pairs = 稿件数 × 评审人数`）。
+
 ### 示例调用
 
 ```bash
@@ -823,6 +936,28 @@ curl -s -X POST http://localhost:8000/assign-roles \
       }'
 # -> assignments 按稿件、角色分组：m1 的 chair->r1、reviewer->r2（r1 不能身兼两角），
 #    m2 的 reviewer->r2、r3（r3 的 poster 赛道限额 1 与总容量同时生效）
+
+# 合作链利益冲突审计：r1 经 dave 与作者 alice 存在 2 跳合作链 -> 判为利益冲突（只读，不改动分配）
+curl -s -X POST http://localhost:8000/conflict-audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "max_hops": 2,
+        "manuscripts": [
+          {"id": "m1", "authors": ["alice", "bob"], "topics": ["ml"]},
+          {"id": "m2", "authors": ["carol"], "topics": ["db"]}
+        ],
+        "reviewers": [
+          {"id": "r1", "topics": ["ml"], "capacity": 2},
+          {"id": "r2", "topics": ["ml", "db"], "capacity": 1, "conflicted_authors": ["carol"]},
+          {"id": "r3", "topics": ["db"], "capacity": 1}
+        ],
+        "collaboration_edges": [
+          {"person_ids": ["r1", "dave"]},
+          {"person_ids": ["dave", "alice"]}
+        ]
+      }'
+# -> m1：r1 不合格（collaboration_chain_conflict，路径 r1->dave->alice），r3 主题不匹配，
+#    r2 合格；m2：r2 显式冲突（author_conflict），r1 主题不匹配，r3 合格
 ```
 
 ## 算法与确定性
@@ -869,6 +1004,11 @@ curl -s -X POST http://localhost:8000/assign-roles \
   （割边只能落在稿件需求侧或评审人下限侧）可知全局不可行时两侧诊断至少其一非空；
   下限 > 容量、下限 > 个人可接上限（合格稿件数经赛道限额与容量折算）属结构性冲突，
   在求解前直接判定。
+- 合作链审计（`/conflict-audit`）：合作关系边去重、去自环后构成无向图，邻接表按
+  ID 升序；每个评审人至多一次限深 BFS（深度 ≤ `max_hops`），按「逐层、同层按父路径
+  字典序」首次访问各节点，记录的父链即到该人员的最短且字典序最小的人员路径；稿件有
+  多个作者时取（链长, 完整 ID 序列）最小者。基础资格规则（自稿 / 显式回避 / 主题匹配）
+  与分配接口复用同一套判定；该接口只读，不改动任何分配结果。
 - 所有节点按 ID 排序后建图，BFS / Dijkstra 均按固定邻接顺序与 (费用, 节点下标) 字典序
   执行，算法无随机性：相同输入（含不同的列表顺序）产生逐字节相同的输出，
   同成本解由 ID 顺序确定性地破除（瓶颈割的节点与边同样按业务 ID 确定排序）。
@@ -886,13 +1026,14 @@ uvicorn app.main:app --reload --port 8000   # 本地起服务
 
 ```
 app/
-  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles
+  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit
   models.py    # 请求/响应模型与校验
-  solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化 + 下限覆盖带下界流 + 分角色全局分配
+  solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化 + 下限覆盖带下界流 + 分角色全局分配 + 合作链冲突审计
 tests/
   test_assign.py          # /assign 端到端测试
   test_assign_coverage.py # /assign-coverage 端到端测试
   test_assign_roles.py    # /assign-roles 端到端测试
+  test_conflict_audit.py  # /conflict-audit 端到端测试
 Dockerfile
 docker-compose.yml
 requirements.txt
